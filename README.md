@@ -24,6 +24,8 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+`cryptg` is included in `requirements.txt` to speed up Telethon media encryption/decryption (often improves download/upload speed noticeably).
+
 Edit `.env`:
 - `API_ID`
 - `API_HASH`
