@@ -1,0 +1,27 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Telegram login session (highly sensitive)
+*.session
+*.session-journal
+.state/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Runtime output
+work/
+*.log
+
+# Local FFmpeg binaries (download on VPS via script)
+vendor/ffmpeg/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
