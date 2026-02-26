@@ -3,7 +3,7 @@
 .env.*
 !.env.example
 
-# Telegram login session (highly sensitive)
+# Telegram login session
 *.session
 *.session-journal
 .state/
@@ -19,7 +19,7 @@ __pycache__/
 work/
 *.log
 
-# Local FFmpeg binaries (download on VPS via script)
+# Local FFmpeg binaries
 vendor/ffmpeg/
 
 # OS/editor noise
