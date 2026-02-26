@@ -4,6 +4,7 @@ import logging
 import os
 import shlex
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -21,6 +22,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tvp")
 PROJECT_DIR = Path(__file__).resolve().parent
+STATUS_UPDATE_INTERVAL_S = 2.0
 
 
 def default_ffmpeg_bin() -> str:
@@ -37,6 +39,34 @@ def default_session_name() -> str:
     session_dir = PROJECT_DIR / ".state" / "telethon"
     session_dir.mkdir(parents=True, exist_ok=True)
     return str(session_dir / "tvp_user")
+
+
+def format_duration(seconds: int | float) -> str:
+    total = max(0, int(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def progress_bar(current: int | float, total: int | float, width: int = 12) -> str:
+    if not total or total <= 0:
+        return "[............]"
+    ratio = max(0.0, min(1.0, float(current) / float(total)))
+    filled = int(ratio * width)
+    return "[" + ("#" * filled) + ("." * (width - filled)) + "]"
+
+
+def scale_short_side_filter(target: int) -> str:
+    # "480p/720p/1080p" means cap the shorter side to the target while
+    # preserving aspect ratio (and avoiding upscaling).
+    return (
+        "scale="
+        f"'if(gte(iw,ih),-2,min({target},iw))':"
+        f"'if(gte(iw,ih),min({target},ih),-2)'"
+        ":flags=lanczos,setsar=1"
+    )
 
 
 @dataclass
@@ -74,7 +104,7 @@ class Settings:
             work_dir=work_dir,
             ffmpeg_bin=(os.getenv("FFMPEG_BIN", "").strip() or default_ffmpeg_bin()),
             ffprobe_bin=(os.getenv("FFPROBE_BIN", "").strip() or default_ffprobe_bin()),
-            command_prefix=os.getenv("COMMAND_PREFIX", ".vproc"),
+            command_prefix=os.getenv("COMMAND_PREFIX", ".vp"),
             cleanup=os.getenv("CLEANUP", "true").lower() in {"1", "true", "yes", "y"},
         )
 
@@ -106,7 +136,7 @@ def parse_command(text: str, prefix: str) -> tuple[str, str]:
         return "", ""
     tail = text[len(prefix) :].strip()
     if not tail:
-        return "mp4", ""
+        return "720p", ""
     parts = tail.split(None, 1)
     mode = parts[0].lower()
     extra = parts[1] if len(parts) > 1 else ""
@@ -114,7 +144,7 @@ def parse_command(text: str, prefix: str) -> tuple[str, str]:
 
 
 def build_ffmpeg_cmd(ffmpeg_bin: str, mode: str, src: Path, dst: Path, extra: str) -> list[str]:
-    base = [ffmpeg_bin, "-y", "-hide_banner", "-i", str(src)]
+    base = [ffmpeg_bin, "-y", "-hide_banner", "-progress", "pipe:1", "-nostats", "-i", str(src)]
     mode = mode.lower()
 
     if mode in {"mp4", "h264"}:
@@ -128,15 +158,40 @@ def build_ffmpeg_cmd(ffmpeg_bin: str, mode: str, src: Path, dst: Path, extra: st
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            "slow",
             "-crf",
-            "23",
+            "30",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "96k",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+
+    if mode == "480p":
+        return base + [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            scale_short_side_filter(480),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "slow",
+            "-crf",
+            "31",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
             "-movflags",
             "+faststart",
             str(dst),
@@ -149,19 +204,44 @@ def build_ffmpeg_cmd(ffmpeg_bin: str, mode: str, src: Path, dst: Path, extra: st
             "-map",
             "0:a?",
             "-vf",
-            "scale='min(1280,iw)':-2,setsar=1",
+            scale_short_side_filter(720),
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            "slow",
             "-crf",
-            "24",
+            "30",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "80k",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+
+    if mode == "1080p":
+        return base + [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            scale_short_side_filter(1080),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "slow",
+            "-crf",
+            "29",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
             "-movflags",
             "+faststart",
             str(dst),
@@ -176,9 +256,9 @@ def build_ffmpeg_cmd(ffmpeg_bin: str, mode: str, src: Path, dst: Path, extra: st
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            "slow",
             "-crf",
-            "23",
+            "30",
             "-pix_fmt",
             "yuv420p",
             "-an",
@@ -199,7 +279,7 @@ def build_ffmpeg_cmd(ffmpeg_bin: str, mode: str, src: Path, dst: Path, extra: st
             raise ValueError("custom mode requires ffmpeg arguments after the mode")
         # User-supplied ffmpeg args are parsed shell-style. Use only in trusted chats.
         user_args = shlex.split(extra)
-        return [ffmpeg_bin, "-y", "-hide_banner", "-i", str(src), *user_args, str(dst)]
+        return [ffmpeg_bin, "-y", "-hide_banner", "-progress", "pipe:1", "-nostats", "-i", str(src), *user_args, str(dst)]
 
     raise ValueError(f"Unsupported mode: {mode}")
 
@@ -213,6 +293,47 @@ async def run_subprocess(cmd: Iterable[str]) -> tuple[int, str]:
     out, _ = await proc.communicate()
     text = (out or b"").decode("utf-8", errors="replace")
     return proc.returncode, text
+
+
+class StatusUpdater:
+    def __init__(self, message):
+        self.message = message
+        self._last_text = None
+        self._last_edit = 0.0
+        self._lock = asyncio.Lock()
+
+    async def set(self, text: str, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and text == self._last_text:
+            return
+        if not force and (now - self._last_edit) < STATUS_UPDATE_INTERVAL_S:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            if not force and text == self._last_text:
+                return
+            if not force and (now - self._last_edit) < STATUS_UPDATE_INTERVAL_S:
+                return
+            try:
+                await self.message.edit(text)
+                self._last_text = text
+                self._last_edit = now
+            except Exception:
+                log.exception("Failed to edit status message")
+
+    def progress_callback(self, stage: str):
+        state = {"last": 0.0}
+
+        def cb(current: int, total: int):
+            now = time.monotonic()
+            if total and current < total and (now - state["last"]) < STATUS_UPDATE_INTERVAL_S:
+                return
+            state["last"] = now
+            pct = (current / total * 100.0) if total else 0.0
+            line = f"{stage} {progress_bar(current, total)} {pct:5.1f}% ({current//1048576} / {max(total,0)//1048576} MiB)"
+            asyncio.create_task(self.set(line))
+
+        return cb
 
 
 def _parse_int(value, default=0) -> int:
@@ -265,6 +386,45 @@ async def probe_video_metadata(ffprobe_bin: str, path: Path) -> dict | None:
     return {"width": width, "height": height, "duration": max(duration, 0)}
 
 
+async def run_ffmpeg_with_progress(
+    cmd: Iterable[str],
+    status: StatusUpdater,
+    input_duration_s: int | None = None,
+) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    assert proc.stdout is not None
+
+    lines: list[str] = []
+    last_processed_s = 0
+    async for raw in proc.stdout:
+        line = raw.decode("utf-8", errors="replace").rstrip()
+        lines.append(line)
+        if line.startswith("out_time_ms="):
+            try:
+                out_ms = int(line.split("=", 1)[1])
+                last_processed_s = max(0, out_ms // 1_000_000)
+            except ValueError:
+                continue
+            if input_duration_s and input_duration_s > 0:
+                pct = min(100.0, (last_processed_s / input_duration_s) * 100.0)
+                text = (
+                    f"Processing {progress_bar(last_processed_s, input_duration_s)} "
+                    f"{pct:5.1f}% ({format_duration(last_processed_s)} / {format_duration(input_duration_s)})"
+                )
+            else:
+                text = f"Processing {format_duration(last_processed_s)}"
+            await status.set(text)
+        elif line.startswith("progress=") and line.endswith("end"):
+            await status.set("Processing complete", force=True)
+
+    code = await proc.wait()
+    return code, "\n".join(lines)
+
+
 def chat_allowed(event, settings: Settings) -> bool:
     if not settings.allowed_chats:
         return True
@@ -280,7 +440,7 @@ def chat_allowed(event, settings: Settings) -> bool:
     return False
 
 
-async def process_reply(event, settings: Settings, mode: str, extra: str) -> None:
+async def process_reply(event, settings: Settings, mode: str, extra: str, status_msg=None) -> None:
     reply = await event.get_reply_message()
     if not reply or not reply.file:
         await event.reply("Reply to a video/file with the command.")
@@ -289,42 +449,51 @@ async def process_reply(event, settings: Settings, mode: str, extra: str) -> Non
         await event.reply("Replied message is not a video.")
         return
 
-    await event.reply(f"Queued: `{mode}`")
+    status_message = status_msg or await event.reply(f"Queued: `{mode}`")
+    status = StatusUpdater(status_message)
 
     with tempfile.TemporaryDirectory(dir=settings.work_dir) as tmp_dir:
         tmp = Path(tmp_dir)
         src_name = reply.file.name or f"input_{reply.id}"
         requested_src_path = tmp / src_name
 
-        status = await event.reply("Downloading...")
-        downloaded = await reply.download_media(file=str(requested_src_path))
+        await status.set("Downloading...", force=True)
+        downloaded = await reply.download_media(
+            file=str(requested_src_path),
+            progress_callback=status.progress_callback("Downloading"),
+        )
         if not downloaded:
-            await status.edit("Download failed.")
+            await status.set("Download failed.", force=True)
             return
 
         src_path = Path(downloaded)
         out_suffix = ".mkv" if mode == "copy" else ".mp4"
         out_path = tmp / f"{src_path.stem}_{mode}{out_suffix}"
-        await status.edit("Processing with ffmpeg...")
+        in_meta = await probe_video_metadata(settings.ffprobe_bin, src_path)
+        await status.set("Processing with ffmpeg...", force=True)
 
         try:
             cmd = build_ffmpeg_cmd(settings.ffmpeg_bin, mode, src_path, out_path, extra)
         except Exception as exc:
-            await status.edit(f"Invalid command: {exc}")
+            await status.set(f"Invalid command: {exc}", force=True)
             return
 
         log.info("Running ffmpeg: %s", " ".join(shlex.quote(x) for x in cmd))
-        code, ffout = await run_subprocess(cmd)
+        code, ffout = await run_ffmpeg_with_progress(
+            cmd,
+            status,
+            input_duration_s=(in_meta or {}).get("duration"),
+        )
         if code != 0:
             log.error("ffmpeg failed (%s): %s", code, ffout[-4000:])
-            await status.edit(f"ffmpeg failed (exit {code}). Check logs.")
+            await status.set(f"ffmpeg failed (exit {code}). Check logs.", force=True)
             return
 
         if not out_path.exists():
-            await status.edit("ffmpeg finished, but output file was not created.")
+            await status.set("ffmpeg finished, but output file was not created.", force=True)
             return
 
-        await status.edit("Uploading result...")
+        await status.set("Uploading result...", force=True)
 
         caption = f"Processed with `{mode}`"
         attributes = None
@@ -354,8 +523,14 @@ async def process_reply(event, settings: Settings, mode: str, extra: str) -> Non
             supports_streaming=out_path.suffix.lower() == ".mp4",
             force_document=False,
             attributes=attributes,
+            progress_callback=status.progress_callback("Uploading"),
         )
-        await status.edit("Done.")
+        await status.set("Done.", force=True)
+        try:
+            # Delete both the temporary status message and the user trigger message.
+            await event.client.delete_messages(event.chat_id, [status_message.id, event.message.id])
+        except Exception:
+            log.exception("Failed to delete status/trigger message(s)")
 
         if not settings.cleanup:
             saved_dir = settings.work_dir / f"job_{reply.id}"
@@ -381,14 +556,15 @@ async def main() -> None:
         if not mode:
             return
         if not event.is_reply:
-            await event.reply("Use this as a reply to a video. Example: `.vproc 720p`")
+            await event.reply("Use this as a reply to a video. Example: `.vp 720p`")
             return
 
         try:
+            queued_msg = None
             if job_lock.locked():
-                await event.reply("Another job is running. Your request will start after it finishes.")
+                queued_msg = await event.reply("Queued. Waiting for current job to finish...")
             async with job_lock:
-                await process_reply(event, settings, mode, extra)
+                await process_reply(event, settings, mode, extra, status_msg=queued_msg)
         except Exception:
             log.exception("Unhandled error while processing message")
             await event.reply("Internal error. Check logs.")
