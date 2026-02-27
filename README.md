@@ -70,6 +70,12 @@ Reply to a video message with:
 - `.vp copy` -> stream copy (no re-encode, outputs `.mkv`)
 - `.vp custom <ffmpeg args>` -> trusted chats only
 
+Queue management commands:
+
+- `.vp jobs` (or `.vp list`) -> list current in-progress + pending jobs
+- `.vp clear all` -> clear in-progress + all pending jobs
+- `.vp clear <job_id>` -> clear one specific job
+
 Or reply to a message that contains a direct video URL:
 
 - message text: `https://example.com/path/video.mp4`

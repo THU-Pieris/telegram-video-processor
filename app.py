@@ -178,6 +178,12 @@ class JobQueueStore:
             self.in_progress = None
             await self._save_locked()
 
+    async def finish_job(self, job_id: str) -> None:
+        async with self._lock:
+            if self.in_progress and self.in_progress.job_id == job_id:
+                self.in_progress = None
+                await self._save_locked()
+
     async def total_jobs(self) -> int:
         async with self._lock:
             return len(self.pending) + (1 if self.in_progress else 0)
@@ -185,6 +191,36 @@ class JobQueueStore:
     async def has_pending(self) -> bool:
         async with self._lock:
             return bool(self.pending)
+
+    async def snapshot(self) -> tuple[JobRecord | None, list[JobRecord]]:
+        async with self._lock:
+            return self.in_progress, list(self.pending)
+
+    async def remove_job(self, job_id: str) -> JobRecord | None:
+        async with self._lock:
+            if self.in_progress and self.in_progress.job_id == job_id:
+                removed = self.in_progress
+                self.in_progress = None
+                await self._save_locked()
+                return removed
+
+            for idx, job in enumerate(self.pending):
+                if job.job_id == job_id:
+                    removed = self.pending.pop(idx)
+                    await self._save_locked()
+                    return removed
+        return None
+
+    async def clear_all_jobs(self) -> list[JobRecord]:
+        async with self._lock:
+            removed: list[JobRecord] = []
+            if self.in_progress:
+                removed.append(self.in_progress)
+            removed.extend(self.pending)
+            self.in_progress = None
+            self.pending = []
+            await self._save_locked()
+            return removed
 
     async def _save_locked(self) -> None:
         data = {
@@ -583,6 +619,29 @@ def chat_allowed(event, settings: Settings) -> bool:
     return False
 
 
+def format_job_line(job: JobRecord, state: str) -> str:
+    source = "url" if job.source_url else "telegram"
+    return (
+        f"- `{job.job_id}` [{state}] `{job.mode}` source={source} "
+        f"chat={job.chat_id} cmd={job.command_message_id}"
+    )
+
+
+async def delete_job_messages(client: TelegramClient, jobs: Iterable[JobRecord]) -> None:
+    by_chat: dict[int, set[int]] = {}
+    for job in jobs:
+        msg_ids = by_chat.setdefault(job.chat_id, set())
+        msg_ids.add(job.command_message_id)
+        if job.status_message_id:
+            msg_ids.add(job.status_message_id)
+
+    for chat_id, ids in by_chat.items():
+        try:
+            await client.delete_messages(chat_id, sorted(ids))
+        except Exception:
+            log.exception("Failed to delete messages for cleared jobs in chat %s", chat_id)
+
+
 async def process_job(client: TelegramClient, settings: Settings, job: JobRecord) -> None:
     status_message = None
     if job.status_message_id:
@@ -716,11 +775,15 @@ async def main() -> None:
     queue_store = JobQueueStore(settings.queue_file)
     await queue_store.load()
     queue_event = asyncio.Event()
+    cancelled_job_ids: set[str] = set()
+    active_job_id: str | None = None
+    active_job_task: asyncio.Task | None = None
 
     if await queue_store.has_pending():
         queue_event.set()
 
     async def worker_loop() -> None:
+        nonlocal active_job_id, active_job_task
         while True:
             await queue_event.wait()
             while True:
@@ -728,11 +791,16 @@ async def main() -> None:
                 if job is None:
                     queue_event.clear()
                     break
+                active_job_id = job.job_id
+                active_job_task = asyncio.create_task(process_job(client, settings, job))
                 try:
-                    await process_job(client, settings, job)
+                    await active_job_task
                 except asyncio.CancelledError:
-                    # Keep `in_progress` on disk so an interrupted job can resume after restart.
-                    raise
+                    if job.job_id in cancelled_job_ids:
+                        cancelled_job_ids.discard(job.job_id)
+                    else:
+                        # Keep `in_progress` on disk so an interrupted job can resume after restart.
+                        raise
                 except Exception:
                     log.exception("Unhandled error while processing job %s", job.job_id)
                     try:
@@ -743,7 +811,10 @@ async def main() -> None:
                         )
                     except Exception:
                         log.exception("Failed to send internal-error message for job %s", job.job_id)
-                    await queue_store.finish_current()
+                finally:
+                    active_job_id = None
+                    active_job_task = None
+                await queue_store.finish_job(job.job_id)
 
     @client.on(events.NewMessage)
     async def handler(event):
@@ -753,11 +824,56 @@ async def main() -> None:
         mode, extra = parse_command(event.raw_text, settings.command_prefix)
         if not mode:
             return
-        if not event.is_reply:
-            await event.reply("Use this as a reply to a video or direct URL message. Example: `.vp 720p`")
-            return
         if event.chat_id is None:
             await event.reply("Unable to determine chat id for this message.")
+            return
+
+        if mode in {"jobs", "list"}:
+            in_progress, pending = await queue_store.snapshot()
+            lines = ["Current queue state:"]
+            if in_progress:
+                lines.append(format_job_line(in_progress, "in_progress"))
+            else:
+                lines.append("- no in-progress job")
+            if pending:
+                for job in pending:
+                    lines.append(format_job_line(job, "pending"))
+            else:
+                lines.append("- no pending jobs")
+            await event.reply("\n".join(lines))
+            return
+
+        if mode == "clear":
+            target = (extra or "").strip()
+            if target in {"all", "*"}:
+                removed = await queue_store.clear_all_jobs()
+                if active_job_id and active_job_task and not active_job_task.done():
+                    cancelled_job_ids.add(active_job_id)
+                    active_job_task.cancel()
+                await delete_job_messages(client, removed)
+                queue_event.clear()
+                await event.reply(f"Cleared {len(removed)} job(s).")
+                return
+
+            if not target:
+                await event.reply("Usage: `.vp clear all` or `.vp clear <job_id>`")
+                return
+
+            removed = await queue_store.remove_job(target)
+            if not removed:
+                await event.reply(f"Job not found: `{target}`")
+                return
+            if active_job_id == removed.job_id and active_job_task and not active_job_task.done():
+                cancelled_job_ids.add(removed.job_id)
+                active_job_task.cancel()
+            await delete_job_messages(client, [removed])
+            if not await queue_store.has_pending():
+                queue_event.clear()
+            await event.reply(f"Cleared job `{removed.job_id}`.")
+            return
+
+        if not event.is_reply:
+            await event.reply("Use this as a reply to a video or direct URL message. Example: `.vp 720p`")
             return
 
         try:
