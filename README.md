@@ -7,6 +7,7 @@ Workflow:
 2. The VPS downloads the video
 3. Runs `ffmpeg`
 4. Uploads the result back to the same chat
+5. Jobs are queued on disk, so after restart/reboot unfinished jobs resume automatically
 
 Also supported:
 1. Reply to a message that contains a direct `http(s)` video URL with `.vp ...`
@@ -36,6 +37,7 @@ Edit `.env`:
 - `API_ID`
 - `API_HASH`
 - optionally `ALLOWED_CHATS` (recommended for safety)
+- optionally `QUEUE_FILE` to customize where persistent queue state is stored
 
 ## Use a local (project) FFmpeg binary
 
@@ -88,6 +90,7 @@ Examples:
 - `custom` mode is powerful but unsafe if untrusted users can trigger it.
 - Use `ALLOWED_CHATS` to restrict which chats are allowed to run commands.
 - This is a simple single-process worker; jobs run one at a time.
+- Jobs are persisted to `QUEUE_FILE`; pending/in-progress jobs are resumed on next startup.
 - Re-encode presets prioritize smaller file size over visual quality.
 - The worker updates a temporary progress message (download/process/upload) and deletes it after a successful run.
 - URL mode expects a direct video file URL (not a webpage).

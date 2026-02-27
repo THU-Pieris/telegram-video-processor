@@ -6,8 +6,9 @@ import re
 import shlex
 import tempfile
 import time
+import uuid
 from urllib.parse import unquote, urlsplit
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -84,6 +85,7 @@ class Settings:
     ffprobe_bin: str
     command_prefix: str
     cleanup: bool
+    queue_file: Path
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -99,6 +101,8 @@ class Settings:
         }
         work_dir = Path(os.getenv("WORK_DIR", "./work")).expanduser()
         work_dir.mkdir(parents=True, exist_ok=True)
+        queue_file = Path(os.getenv("QUEUE_FILE", "./.state/job_queue.json")).expanduser()
+        queue_file.parent.mkdir(parents=True, exist_ok=True)
 
         return cls(
             api_id=int(api_id_raw),
@@ -110,7 +114,86 @@ class Settings:
             ffprobe_bin=(os.getenv("FFPROBE_BIN", "").strip() or default_ffprobe_bin()),
             command_prefix=os.getenv("COMMAND_PREFIX", ".vp"),
             cleanup=os.getenv("CLEANUP", "true").lower() in {"1", "true", "yes", "y"},
+            queue_file=queue_file,
         )
+
+
+@dataclass
+class JobRecord:
+    job_id: str
+    chat_id: int
+    command_message_id: int
+    reply_message_id: int
+    mode: str
+    extra: str
+    source_url: str | None
+    queued_at: float
+    status_message_id: int | None = None
+
+
+class JobQueueStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.pending: list[JobRecord] = []
+        self.in_progress: JobRecord | None = None
+        self._lock = asyncio.Lock()
+
+    async def load(self) -> None:
+        async with self._lock:
+            if not self.path.exists():
+                return
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                log.exception("Failed to read queue file, starting with empty queue")
+                return
+
+            self.pending = [JobRecord(**item) for item in (data.get("pending") or [])]
+            raw_in_progress = data.get("in_progress")
+            self.in_progress = JobRecord(**raw_in_progress) if raw_in_progress else None
+
+            # If the app crashed/restarted mid-job, retry it first.
+            if self.in_progress is not None:
+                self.pending.insert(0, self.in_progress)
+                self.in_progress = None
+                await self._save_locked()
+
+    async def enqueue(self, job: JobRecord) -> int:
+        async with self._lock:
+            self.pending.append(job)
+            await self._save_locked()
+            return len(self.pending)
+
+    async def next_job(self) -> JobRecord | None:
+        async with self._lock:
+            if not self.pending:
+                return None
+            job = self.pending.pop(0)
+            self.in_progress = job
+            await self._save_locked()
+            return job
+
+    async def finish_current(self) -> None:
+        async with self._lock:
+            self.in_progress = None
+            await self._save_locked()
+
+    async def total_jobs(self) -> int:
+        async with self._lock:
+            return len(self.pending) + (1 if self.in_progress else 0)
+
+    async def has_pending(self) -> bool:
+        async with self._lock:
+            return bool(self.pending)
+
+    async def _save_locked(self) -> None:
+        data = {
+            "pending": [asdict(j) for j in self.pending],
+            "in_progress": asdict(self.in_progress) if self.in_progress else None,
+        }
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
 
 
 def is_video_message(msg) -> bool:
@@ -500,19 +583,39 @@ def chat_allowed(event, settings: Settings) -> bool:
     return False
 
 
-async def process_reply(event, settings: Settings, mode: str, extra: str, status_msg=None) -> None:
-    reply = await event.get_reply_message()
-    if not reply:
-        await event.reply("Reply to a video/file or a message containing a direct video URL.")
-        return
-
-    status_message = status_msg or await event.reply(f"Queued: `{mode}`")
+async def process_job(client: TelegramClient, settings: Settings, job: JobRecord) -> None:
+    status_message = None
+    if job.status_message_id:
+        status_message = await client.get_messages(job.chat_id, ids=job.status_message_id)
+    if not status_message:
+        status_message = await client.send_message(
+            job.chat_id,
+            f"Queued: `{job.mode}`",
+            reply_to=job.command_message_id,
+        )
     status = StatusUpdater(status_message)
+
+    reply = await client.get_messages(job.chat_id, ids=job.reply_message_id)
+    if not reply:
+        await status.set("Source message no longer exists.", force=True)
+        return
 
     with tempfile.TemporaryDirectory(dir=settings.work_dir) as tmp_dir:
         tmp = Path(tmp_dir)
         src_path: Path
-        if getattr(reply, "file", None) and is_video_message(reply):
+        if job.source_url:
+            src_name = filename_from_url(job.source_url, fallback=f"input_{reply.id}.mp4")
+            requested_src_path = tmp / src_name
+            await status.set("Downloading from direct URL...", force=True)
+            try:
+                src_path = await download_from_direct_url(job.source_url, requested_src_path, status)
+            except Exception as exc:
+                await status.set(f"Direct URL download failed: {exc}", force=True)
+                return
+        else:
+            if not getattr(reply, "file", None) or not is_video_message(reply):
+                await status.set("Replied message is no longer a valid video.", force=True)
+                return
             src_name = reply.file.name or f"input_{reply.id}"
             requested_src_path = tmp / src_name
             await status.set("Downloading from Telegram...", force=True)
@@ -524,22 +627,9 @@ async def process_reply(event, settings: Settings, mode: str, extra: str, status
                 await status.set("Download failed.", force=True)
                 return
             src_path = Path(downloaded)
-        else:
-            source_url = extract_first_http_url(getattr(reply, "raw_text", None) or getattr(reply, "message", None))
-            if not source_url:
-                await event.reply("Replied message must be a video/file or contain a direct `http(s)` video URL.")
-                return
-            src_name = filename_from_url(source_url, fallback=f"input_{reply.id}.mp4")
-            requested_src_path = tmp / src_name
-            await status.set("Downloading from direct URL...", force=True)
-            try:
-                src_path = await download_from_direct_url(source_url, requested_src_path, status)
-            except Exception as exc:
-                await status.set(f"Direct URL download failed: {exc}", force=True)
-                return
 
-        out_suffix = ".mkv" if mode == "copy" else ".mp4"
-        out_path = tmp / f"{src_path.stem}_{mode}{out_suffix}"
+        out_suffix = ".mkv" if job.mode == "copy" else ".mp4"
+        out_path = tmp / f"{src_path.stem}_{job.mode}{out_suffix}"
         in_meta = await probe_video_metadata(settings.ffprobe_bin, src_path)
         if not in_meta:
             await status.set("Input is not a valid video or metadata probe failed.", force=True)
@@ -547,7 +637,7 @@ async def process_reply(event, settings: Settings, mode: str, extra: str, status
         await status.set("Processing with ffmpeg...", force=True)
 
         try:
-            cmd = build_ffmpeg_cmd(settings.ffmpeg_bin, mode, src_path, out_path, extra)
+            cmd = build_ffmpeg_cmd(settings.ffmpeg_bin, job.mode, src_path, out_path, job.extra)
         except Exception as exc:
             await status.set(f"Invalid command: {exc}", force=True)
             return
@@ -569,7 +659,7 @@ async def process_reply(event, settings: Settings, mode: str, extra: str, status
 
         await status.set("Uploading result...", force=True)
 
-        caption = f"Processed with `{mode}`"
+        caption = f"Processed with `{job.mode}`"
         attributes = None
         if out_path.suffix.lower() == ".mp4":
             meta = await probe_video_metadata(settings.ffprobe_bin, out_path)
@@ -589,11 +679,11 @@ async def process_reply(event, settings: Settings, mode: str, extra: str, status
                     )
                 ]
 
-        await event.client.send_file(
-            event.chat_id,
+        await client.send_file(
+            job.chat_id,
             str(out_path),
             caption=caption,
-            reply_to=reply.id,
+            reply_to=job.reply_message_id,
             supports_streaming=out_path.suffix.lower() == ".mp4",
             force_document=False,
             attributes=attributes,
@@ -602,24 +692,58 @@ async def process_reply(event, settings: Settings, mode: str, extra: str, status
         await status.set("Done.", force=True)
         try:
             # Delete both the temporary status message and the user trigger message.
-            await event.client.delete_messages(event.chat_id, [status_message.id, event.message.id])
+            await client.delete_messages(job.chat_id, [status_message.id, job.command_message_id])
         except Exception:
             log.exception("Failed to delete status/trigger message(s)")
 
         if not settings.cleanup:
-            saved_dir = settings.work_dir / f"job_{reply.id}"
+            saved_dir = settings.work_dir / f"job_{job.reply_message_id}"
             saved_dir.mkdir(parents=True, exist_ok=True)
             src_copy = saved_dir / src_path.name
             out_copy = saved_dir / out_path.name
             src_path.replace(src_copy)
             out_path.replace(out_copy)
-            await event.reply(f"Saved files to `{saved_dir}`")
+            await client.send_message(
+                job.chat_id,
+                f"Saved files to `{saved_dir}`",
+                reply_to=job.command_message_id,
+            )
 
 
 async def main() -> None:
     settings = Settings.from_env()
     client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
-    job_lock = asyncio.Lock()
+    queue_store = JobQueueStore(settings.queue_file)
+    await queue_store.load()
+    queue_event = asyncio.Event()
+
+    if await queue_store.has_pending():
+        queue_event.set()
+
+    async def worker_loop() -> None:
+        while True:
+            await queue_event.wait()
+            while True:
+                job = await queue_store.next_job()
+                if job is None:
+                    queue_event.clear()
+                    break
+                try:
+                    await process_job(client, settings, job)
+                except asyncio.CancelledError:
+                    # Keep `in_progress` on disk so an interrupted job can resume after restart.
+                    raise
+                except Exception:
+                    log.exception("Unhandled error while processing job %s", job.job_id)
+                    try:
+                        await client.send_message(
+                            job.chat_id,
+                            "Internal error while processing queued job. Check logs.",
+                            reply_to=job.command_message_id,
+                        )
+                    except Exception:
+                        log.exception("Failed to send internal-error message for job %s", job.job_id)
+                    await queue_store.finish_current()
 
     @client.on(events.NewMessage)
     async def handler(event):
@@ -630,24 +754,52 @@ async def main() -> None:
         if not mode:
             return
         if not event.is_reply:
-            await event.reply("Use this as a reply to a video. Example: `.vp 720p`")
+            await event.reply("Use this as a reply to a video or direct URL message. Example: `.vp 720p`")
+            return
+        if event.chat_id is None:
+            await event.reply("Unable to determine chat id for this message.")
             return
 
         try:
-            queued_msg = None
-            if job_lock.locked():
-                queued_msg = await event.reply("Queued. Waiting for current job to finish...")
-            async with job_lock:
-                await process_reply(event, settings, mode, extra, status_msg=queued_msg)
+            reply = await event.get_reply_message()
+            if not reply:
+                await event.reply("Reply to a video/file or a message containing a direct video URL.")
+                return
+
+            source_url = None
+            if not (getattr(reply, "file", None) and is_video_message(reply)):
+                source_url = extract_first_http_url(getattr(reply, "raw_text", None) or getattr(reply, "message", None))
+                if not source_url:
+                    await event.reply("Replied message must be a video/file or contain a direct `http(s)` video URL.")
+                    return
+
+            total_before = await queue_store.total_jobs()
+            queue_text = "Queued. Waiting for current job to finish..." if total_before > 0 else "Queued. Starting soon..."
+            queued_msg = await event.reply(queue_text)
+            job = JobRecord(
+                job_id=str(uuid.uuid4()),
+                chat_id=int(event.chat_id),
+                command_message_id=event.message.id,
+                reply_message_id=reply.id,
+                mode=mode,
+                extra=extra,
+                source_url=source_url,
+                queued_at=time.time(),
+                status_message_id=queued_msg.id,
+            )
+            await queue_store.enqueue(job)
+            queue_event.set()
         except Exception:
-            log.exception("Unhandled error while processing message")
+            log.exception("Unhandled error while enqueuing message")
             await event.reply("Internal error. Check logs.")
 
     log.info("Starting client. Command prefix: %s", settings.command_prefix)
     log.info("Allowed chats: %s", sorted(settings.allowed_chats) if settings.allowed_chats else "ALL")
+    log.info("Queue file: %s", settings.queue_file)
     await client.start()
     me = await client.get_me()
     log.info("Logged in as %s (%s)", getattr(me, "username", None) or me.first_name, me.id)
+    asyncio.create_task(worker_loop())
     await client.run_until_disconnected()
 
 
