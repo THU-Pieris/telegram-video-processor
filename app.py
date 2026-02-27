@@ -2,13 +2,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import tempfile
 import time
+from urllib.parse import unquote, urlsplit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import aiohttp
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeVideo
@@ -23,6 +26,7 @@ logging.basicConfig(
 log = logging.getLogger("tvp")
 PROJECT_DIR = Path(__file__).resolve().parent
 STATUS_UPDATE_INTERVAL_S = 2.0
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 def default_ffmpeg_bin() -> str:
@@ -284,6 +288,23 @@ def build_ffmpeg_cmd(ffmpeg_bin: str, mode: str, src: Path, dst: Path, extra: st
     raise ValueError(f"Unsupported mode: {mode}")
 
 
+def extract_first_http_url(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = URL_RE.search(text)
+    if not match:
+        return None
+    return match.group(0).strip("()[]<>.,!?:;\"'")
+
+
+def filename_from_url(url: str, fallback: str) -> str:
+    path = urlsplit(url).path
+    name = Path(unquote(path)).name.strip()
+    if name and "." in name:
+        return name
+    return fallback
+
+
 async def run_subprocess(cmd: Iterable[str]) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -386,6 +407,45 @@ async def probe_video_metadata(ffprobe_bin: str, path: Path) -> dict | None:
     return {"width": width, "height": height, "duration": max(duration, 0)}
 
 
+async def download_from_direct_url(url: str, dst: Path, status: StatusUpdater) -> Path:
+    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=120)
+    downloaded = 0
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"source URL returned HTTP {resp.status}")
+
+            total = _parse_int(resp.headers.get("Content-Length"), default=0)
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if content_type and not (
+                content_type.startswith("video/")
+                or "octet-stream" in content_type
+                or "application/mp4" in content_type
+            ):
+                raise RuntimeError(f"URL is not a video response (content-type: {content_type})")
+
+            with dst.open("wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 256):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = min(100.0, downloaded / total * 100.0)
+                        text = (
+                            f"Downloading URL {progress_bar(downloaded, total)} "
+                            f"{pct:5.1f}% ({downloaded//1048576} / {total//1048576} MiB)"
+                        )
+                    else:
+                        text = f"Downloading URL {downloaded//1048576} MiB"
+                    await status.set(text)
+
+    if downloaded <= 0:
+        raise RuntimeError("downloaded file is empty")
+
+    return dst
+
+
 async def run_ffmpeg_with_progress(
     cmd: Iterable[str],
     status: StatusUpdater,
@@ -442,11 +502,8 @@ def chat_allowed(event, settings: Settings) -> bool:
 
 async def process_reply(event, settings: Settings, mode: str, extra: str, status_msg=None) -> None:
     reply = await event.get_reply_message()
-    if not reply or not reply.file:
-        await event.reply("Reply to a video/file with the command.")
-        return
-    if not is_video_message(reply):
-        await event.reply("Replied message is not a video.")
+    if not reply:
+        await event.reply("Reply to a video/file or a message containing a direct video URL.")
         return
 
     status_message = status_msg or await event.reply(f"Queued: `{mode}`")
@@ -454,22 +511,39 @@ async def process_reply(event, settings: Settings, mode: str, extra: str, status
 
     with tempfile.TemporaryDirectory(dir=settings.work_dir) as tmp_dir:
         tmp = Path(tmp_dir)
-        src_name = reply.file.name or f"input_{reply.id}"
-        requested_src_path = tmp / src_name
+        src_path: Path
+        if getattr(reply, "file", None) and is_video_message(reply):
+            src_name = reply.file.name or f"input_{reply.id}"
+            requested_src_path = tmp / src_name
+            await status.set("Downloading from Telegram...", force=True)
+            downloaded = await reply.download_media(
+                file=str(requested_src_path),
+                progress_callback=status.progress_callback("Downloading"),
+            )
+            if not downloaded:
+                await status.set("Download failed.", force=True)
+                return
+            src_path = Path(downloaded)
+        else:
+            source_url = extract_first_http_url(getattr(reply, "raw_text", None) or getattr(reply, "message", None))
+            if not source_url:
+                await event.reply("Replied message must be a video/file or contain a direct `http(s)` video URL.")
+                return
+            src_name = filename_from_url(source_url, fallback=f"input_{reply.id}.mp4")
+            requested_src_path = tmp / src_name
+            await status.set("Downloading from direct URL...", force=True)
+            try:
+                src_path = await download_from_direct_url(source_url, requested_src_path, status)
+            except Exception as exc:
+                await status.set(f"Direct URL download failed: {exc}", force=True)
+                return
 
-        await status.set("Downloading...", force=True)
-        downloaded = await reply.download_media(
-            file=str(requested_src_path),
-            progress_callback=status.progress_callback("Downloading"),
-        )
-        if not downloaded:
-            await status.set("Download failed.", force=True)
-            return
-
-        src_path = Path(downloaded)
         out_suffix = ".mkv" if mode == "copy" else ".mp4"
         out_path = tmp / f"{src_path.stem}_{mode}{out_suffix}"
         in_meta = await probe_video_metadata(settings.ffprobe_bin, src_path)
+        if not in_meta:
+            await status.set("Input is not a valid video or metadata probe failed.", force=True)
+            return
         await status.set("Processing with ffmpeg...", force=True)
 
         try:

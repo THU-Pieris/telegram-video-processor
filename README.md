@@ -8,6 +8,12 @@ Workflow:
 3. Runs `ffmpeg`
 4. Uploads the result back to the same chat
 
+Also supported:
+1. Reply to a message that contains a direct `http(s)` video URL with `.vp ...`
+2. The VPS downloads from that URL
+3. Runs `ffmpeg`
+4. Uploads the result back to the same chat
+
 ## Requirements
 
 - Python 3.10+
@@ -62,6 +68,11 @@ Reply to a video message with:
 - `.vp copy` -> stream copy (no re-encode, outputs `.mkv`)
 - `.vp custom <ffmpeg args>` -> trusted chats only
 
+Or reply to a message that contains a direct video URL:
+
+- message text: `https://example.com/path/video.mp4`
+- your reply: `.vp 720p`
+
 Examples:
 
 ```text
@@ -79,3 +90,4 @@ Examples:
 - This is a simple single-process worker; jobs run one at a time.
 - Re-encode presets prioritize smaller file size over visual quality.
 - The worker updates a temporary progress message (download/process/upload) and deletes it after a successful run.
+- URL mode expects a direct video file URL (not a webpage).
