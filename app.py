@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import time
 import uuid
@@ -28,6 +29,8 @@ log = logging.getLogger("tvp")
 PROJECT_DIR = Path(__file__).resolve().parent
 STATUS_UPDATE_INTERVAL_S = 2.0
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+MAX_MEDIA_CAPTION_LEN = 1024
+JOB_TMP_PREFIX = "tvp_job_"
 
 
 def default_ffmpeg_bin() -> str:
@@ -424,13 +427,60 @@ def filename_from_url(url: str, fallback: str) -> str:
     return fallback
 
 
+def message_text(msg) -> str:
+    return (getattr(msg, "message", None) or getattr(msg, "raw_text", None) or "").strip()
+
+
+def utf16_len(text: str) -> int:
+    # Telegram measures text limits in UTF-16 code units, not Python characters
+    # (e.g. most emoji count as 2).
+    return len(text.encode("utf-16-le")) // 2
+
+
+def truncate_utf16(text: str, max_units: int) -> str:
+    if utf16_len(text) <= max_units:
+        return text
+    # Cut on a code-unit boundary; errors="ignore" drops a dangling half of a
+    # surrogate pair so we never emit a broken character.
+    return text.encode("utf-16-le")[: max_units * 2].decode("utf-16-le", errors="ignore")
+
+
+def build_output_caption(mode: str, source_message) -> str:
+    suffix = f"\n\nProcessed with {mode}"
+    source_text = message_text(source_message)
+    if not source_text:
+        return suffix.strip()
+    if utf16_len(source_text) + utf16_len(suffix) <= MAX_MEDIA_CAPTION_LEN:
+        return f"{source_text}{suffix}"
+
+    # Keep the original text when possible and reserve room for the "…" + processing suffix.
+    keep_units = max(0, MAX_MEDIA_CAPTION_LEN - utf16_len(suffix) - 1)
+    truncated = truncate_utf16(source_text, keep_units).rstrip()
+    return f"{truncated}…{suffix}"
+
+
+async def kill_process(proc: asyncio.subprocess.Process) -> None:
+    # Make sure a child process never outlives the task that started it
+    # (e.g. when a job is cancelled via `.vp clear`).
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    await proc.wait()
+
+
 async def run_subprocess(cmd: Iterable[str]) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await proc.communicate()
+    finally:
+        await kill_process(proc)
     text = (out or b"").decode("utf-8", errors="replace")
     return proc.returncode, text
 
@@ -579,28 +629,31 @@ async def run_ffmpeg_with_progress(
 
     lines: list[str] = []
     last_processed_s = 0
-    async for raw in proc.stdout:
-        line = raw.decode("utf-8", errors="replace").rstrip()
-        lines.append(line)
-        if line.startswith("out_time_ms="):
-            try:
-                out_ms = int(line.split("=", 1)[1])
-                last_processed_s = max(0, out_ms // 1_000_000)
-            except ValueError:
-                continue
-            if input_duration_s and input_duration_s > 0:
-                pct = min(100.0, (last_processed_s / input_duration_s) * 100.0)
-                text = (
-                    f"Processing {progress_bar(last_processed_s, input_duration_s)} "
-                    f"{pct:5.1f}% ({format_duration(last_processed_s)} / {format_duration(input_duration_s)})"
-                )
-            else:
-                text = f"Processing {format_duration(last_processed_s)}"
-            await status.set(text)
-        elif line.startswith("progress=") and line.endswith("end"):
-            await status.set("Processing complete", force=True)
+    try:
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            lines.append(line)
+            if line.startswith("out_time_ms="):
+                try:
+                    out_ms = int(line.split("=", 1)[1])
+                    last_processed_s = max(0, out_ms // 1_000_000)
+                except ValueError:
+                    continue
+                if input_duration_s and input_duration_s > 0:
+                    pct = min(100.0, (last_processed_s / input_duration_s) * 100.0)
+                    text = (
+                        f"Processing {progress_bar(last_processed_s, input_duration_s)} "
+                        f"{pct:5.1f}% ({format_duration(last_processed_s)} / {format_duration(input_duration_s)})"
+                    )
+                else:
+                    text = f"Processing {format_duration(last_processed_s)}"
+                await status.set(text)
+            elif line.startswith("progress=") and line.endswith("end"):
+                await status.set("Processing complete", force=True)
 
-    code = await proc.wait()
+        code = await proc.wait()
+    finally:
+        await kill_process(proc)
     return code, "\n".join(lines)
 
 
@@ -642,6 +695,21 @@ async def delete_job_messages(client: TelegramClient, jobs: Iterable[JobRecord])
             log.exception("Failed to delete messages for cleared jobs in chat %s", chat_id)
 
 
+def cleanup_stale_job_dirs(work_dir: Path) -> None:
+    # Jobs run in a TemporaryDirectory that is normally removed when the job ends,
+    # but a hard kill / power loss mid-job leaves it behind. At startup no job is
+    # running yet, so any leftover job dir is stale. Only our own prefix is touched,
+    # so a shared WORK_DIR (e.g. /tmp) is safe.
+    for path in work_dir.glob(f"{JOB_TMP_PREFIX}*"):
+        if not path.is_dir() or path.is_symlink():
+            continue
+        try:
+            shutil.rmtree(path)
+            log.info("Removed stale job dir: %s", path)
+        except Exception:
+            log.exception("Failed to remove stale job dir: %s", path)
+
+
 async def process_job(client: TelegramClient, settings: Settings, job: JobRecord) -> None:
     status_message = None
     if job.status_message_id:
@@ -659,7 +727,7 @@ async def process_job(client: TelegramClient, settings: Settings, job: JobRecord
         await status.set("Source message no longer exists.", force=True)
         return
 
-    with tempfile.TemporaryDirectory(dir=settings.work_dir) as tmp_dir:
+    with tempfile.TemporaryDirectory(dir=settings.work_dir, prefix=JOB_TMP_PREFIX) as tmp_dir:
         tmp = Path(tmp_dir)
         src_path: Path
         if job.source_url:
@@ -718,7 +786,7 @@ async def process_job(client: TelegramClient, settings: Settings, job: JobRecord
 
         await status.set("Uploading result...", force=True)
 
-        caption = f"Processed with `{job.mode}`"
+        caption = build_output_caption(job.mode, reply)
         attributes = None
         if out_path.suffix.lower() == ".mp4":
             meta = await probe_video_metadata(settings.ffprobe_bin, out_path)
@@ -742,6 +810,7 @@ async def process_job(client: TelegramClient, settings: Settings, job: JobRecord
             job.chat_id,
             str(out_path),
             caption=caption,
+            parse_mode=None,
             reply_to=job.reply_message_id,
             supports_streaming=out_path.suffix.lower() == ".mp4",
             force_document=False,
@@ -771,6 +840,7 @@ async def process_job(client: TelegramClient, settings: Settings, job: JobRecord
 
 async def main() -> None:
     settings = Settings.from_env()
+    cleanup_stale_job_dirs(settings.work_dir)
     client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
     queue_store = JobQueueStore(settings.queue_file)
     await queue_store.load()
