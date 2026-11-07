@@ -99,4 +99,5 @@ Examples:
 - Jobs are persisted to `QUEUE_FILE`; pending/in-progress jobs are resumed on next startup.
 - Re-encode presets prioritize smaller file size over visual quality.
 - The worker updates a temporary progress message (download/process/upload) and deletes it after a successful run.
+- After a successful run, a **single standalone source message** (a video, or a message with a direct URL) is replaced: the original message is deleted and the result is posted in its place (as a reply to whatever the original replied to, if anything). A message that is part of an **album** (media group) is kept, and the result is posted as a reply to it. Deleting someone else's message in a group requires admin rights; if that fails, the original is left in place and a warning is logged.
 - URL mode expects a direct video file URL (not a webpage).

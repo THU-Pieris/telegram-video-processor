@@ -710,6 +710,13 @@ def cleanup_stale_job_dirs(work_dir: Path) -> None:
             log.exception("Failed to remove stale job dir: %s", path)
 
 
+def should_delete_source(job: JobRecord, reply) -> bool:
+    # A single, standalone source message (video or direct-URL message) is
+    # replaced by the processed result. Messages that are part of an album
+    # (media group) are kept.
+    return not getattr(reply, "grouped_id", None)
+
+
 async def process_job(client: TelegramClient, settings: Settings, job: JobRecord) -> None:
     status_message = None
     if job.status_message_id:
@@ -806,12 +813,18 @@ async def process_job(client: TelegramClient, settings: Settings, job: JobRecord
                     )
                 ]
 
+        delete_source = should_delete_source(job, reply)
+        # When the original is going away, don't reply to it (that would leave a
+        # dangling "deleted message" reference). Reply to whatever the original was
+        # replying to instead, which also keeps the result in the same forum topic.
+        output_reply_to = reply.reply_to_msg_id if delete_source else job.reply_message_id
+
         await client.send_file(
             job.chat_id,
             str(out_path),
             caption=caption,
             parse_mode=None,
-            reply_to=job.reply_message_id,
+            reply_to=output_reply_to,
             supports_streaming=out_path.suffix.lower() == ".mp4",
             force_document=False,
             attributes=attributes,
@@ -823,6 +836,17 @@ async def process_job(client: TelegramClient, settings: Settings, job: JobRecord
             await client.delete_messages(job.chat_id, [status_message.id, job.command_message_id])
         except Exception:
             log.exception("Failed to delete status/trigger message(s)")
+
+        if delete_source:
+            # Separate call so a permission error here can't block the cleanup above.
+            try:
+                affected = await client.delete_messages(job.chat_id, [reply.id])
+                if not any(getattr(a, "pts_count", 0) for a in (affected or [])):
+                    log.warning("Source message %s in chat %s was not deleted (no permission?)", reply.id, job.chat_id)
+                else:
+                    log.info("Deleted source message %s in chat %s", reply.id, job.chat_id)
+            except Exception:
+                log.exception("Failed to delete source message %s in chat %s", reply.id, job.chat_id)
 
         if not settings.cleanup:
             saved_dir = settings.work_dir / f"job_{job.reply_message_id}"
