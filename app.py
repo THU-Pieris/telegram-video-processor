@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -11,11 +12,12 @@ import uuid
 from urllib.parse import unquote, urlsplit
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterable
 
 import aiohttp
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions, types, utils
 from telethon.tl.types import DocumentAttributeVideo
 
 
@@ -132,6 +134,9 @@ class JobRecord:
     source_url: str | None
     queued_at: float
     status_message_id: int | None = None
+    # Set when the replied message is part of an album that contains videos:
+    # every video in the album is processed and the album is re-sent as a group.
+    grouped_id: int | None = None
 
 
 class JobQueueStore:
@@ -428,7 +433,9 @@ def filename_from_url(url: str, fallback: str) -> str:
 
 
 def message_text(msg) -> str:
-    return (getattr(msg, "message", None) or getattr(msg, "raw_text", None) or "").strip()
+    # Only trailing whitespace is stripped: leading characters would shift the
+    # offsets of the message's formatting entities.
+    return (getattr(msg, "message", None) or "").rstrip()
 
 
 def utf16_len(text: str) -> int:
@@ -445,18 +452,127 @@ def truncate_utf16(text: str, max_units: int) -> str:
     return text.encode("utf-16-le")[: max_units * 2].decode("utf-16-le", errors="ignore")
 
 
-def build_output_caption(mode: str, source_message) -> str:
-    suffix = f"\n\nProcessed with {mode}"
-    source_text = message_text(source_message)
-    if not source_text:
-        return suffix.strip()
-    if utf16_len(source_text) + utf16_len(suffix) <= MAX_MEDIA_CAPTION_LEN:
-        return f"{source_text}{suffix}"
+def clip_entities(entities, limit: int) -> list:
+    # Drop/shorten formatting entities that fall past `limit` UTF-16 units.
+    out = []
+    for e in entities or []:
+        if e.offset >= limit:
+            continue
+        if e.offset + e.length > limit:
+            e = copy.copy(e)
+            e.length = limit - e.offset
+        out.append(e)
+    return out
 
-    # Keep the original text when possible and reserve room for the "…" + processing suffix.
-    keep_units = max(0, MAX_MEDIA_CAPTION_LEN - utf16_len(suffix) - 1)
-    truncated = truncate_utf16(source_text, keep_units).rstrip()
-    return f"{truncated}…{suffix}"
+
+def sendable_entities(entities) -> list:
+    # Received messages describe user mentions as MessageEntityMentionName, which
+    # Telegram won't accept when *sending*. A tg://user link renders the same.
+    out = []
+    for e in entities or []:
+        if isinstance(e, types.MessageEntityMentionName):
+            e = types.MessageEntityTextUrl(offset=e.offset, length=e.length, url=f"tg://user?id={e.user_id}")
+        out.append(e)
+    return out
+
+
+def compose_caption(source_text: str, source_entities, footer_text: str, footer_entities=None) -> tuple[str, list]:
+    """Source caption (with formatting) + footer, within Telegram's caption limit.
+
+    The footer always fits; the source text is truncated with "…" if needed.
+    """
+    sep = "\n\n" if source_text else ""
+    footer_units = utf16_len(sep + footer_text)
+    entities = sendable_entities(source_entities)
+    if utf16_len(source_text) + footer_units > MAX_MEDIA_CAPTION_LEN:
+        keep_units = max(0, MAX_MEDIA_CAPTION_LEN - footer_units - 1)
+        source_text = truncate_utf16(source_text, keep_units).rstrip()
+        entities = clip_entities(entities, utf16_len(source_text))
+        source_text += "…"
+    shift = utf16_len(source_text + sep)
+    for e in footer_entities or []:
+        e = copy.copy(e)
+        e.offset += shift
+        entities.append(e)
+    return source_text + sep + footer_text, entities
+
+
+def chat_username(chat) -> str | None:
+    if chat is None:
+        return None
+    if getattr(chat, "username", None):
+        return chat.username
+    # Channels/users with collectible usernames list them here instead.
+    return next((u.username for u in (getattr(chat, "usernames", None) or []) if getattr(u, "active", False)), None)
+
+
+async def forward_origin(client: TelegramClient, msg) -> tuple[str, list]:
+    """'Forwarded from <link>' text + entities for a forwarded message, else ('', [])."""
+    fwd = getattr(msg, "fwd_from", None)
+    if not fwd:
+        return "", []
+    forward = getattr(msg, "forward", None)
+    peer = fwd.from_id
+    prefix = "Forwarded from "
+    label, entity_for = None, None
+
+    async def resolve(cached):
+        if cached is not None:
+            return cached
+        try:
+            return await client.get_entity(peer)
+        except Exception:
+            log.info("Could not resolve forward origin %s", peer)
+            return None
+
+    if isinstance(peer, (types.PeerChannel, types.PeerChat)):
+        chat = await resolve(getattr(forward, "chat", None))
+        username = chat_username(chat)
+        post = fwd.channel_post
+        label = getattr(chat, "title", None) or fwd.post_author or "original chat"
+        url = None
+        if username and post:
+            url = f"https://t.me/{username}/{post}"
+        elif isinstance(peer, types.PeerChannel) and post:
+            # Private channel: link works for members.
+            url = f"https://t.me/c/{peer.channel_id}/{post}"
+        elif username:
+            url = f"https://t.me/{username}"
+        if url:
+            entity_for = lambda off, n: types.MessageEntityTextUrl(offset=off, length=n, url=url)
+    elif isinstance(peer, types.PeerUser):
+        user = await resolve(getattr(forward, "sender", None))
+        username = chat_username(user)
+        if username:
+            label = f"@{username}"
+            entity_for = lambda off, n: types.MessageEntityMention(offset=off, length=n)
+        else:
+            label = " ".join(x for x in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if x) or "user"
+            entity_for = lambda off, n: types.MessageEntityTextUrl(
+                offset=off, length=n, url=f"tg://user?id={peer.user_id}"
+            )
+    elif fwd.from_name:
+        # Sender hides their account when forwarded: name only, nothing to link to.
+        label = fwd.from_name
+
+    if not label:
+        return "", []
+    entities = [entity_for(utf16_len(prefix), utf16_len(label))] if entity_for else []
+    return prefix + label, entities
+
+
+async def build_output_caption(client: TelegramClient, mode: str, source_message) -> tuple[str, list]:
+    footer = f"Processed with {mode}"
+    origin, origin_entities = await forward_origin(client, source_message)
+    footer_entities = []
+    if origin:
+        footer_entities = [copy.copy(e) for e in origin_entities]
+        for e in footer_entities:
+            e.offset += utf16_len(footer + "\n")
+        footer = f"{footer}\n{origin}"
+    return compose_caption(
+        message_text(source_message), getattr(source_message, "entities", None), footer, footer_entities
+    )
 
 
 async def kill_process(proc: asyncio.subprocess.Process) -> None:
@@ -488,11 +604,13 @@ async def run_subprocess(cmd: Iterable[str]) -> tuple[int, str]:
 class StatusUpdater:
     def __init__(self, message):
         self.message = message
+        self.prefix = ""  # e.g. "[video 2/5] " while working through an album
         self._last_text = None
         self._last_edit = 0.0
         self._lock = asyncio.Lock()
 
     async def set(self, text: str, force: bool = False) -> None:
+        text = self.prefix + text
         now = time.monotonic()
         if not force and text == self._last_text:
             return
@@ -711,10 +829,125 @@ def cleanup_stale_job_dirs(work_dir: Path) -> None:
 
 
 def should_delete_source(job: JobRecord, reply) -> bool:
-    # A single, standalone source message (video or direct-URL message) is
-    # replaced by the processed result. Messages that are part of an album
-    # (media group) are kept.
+    # Single-message jobs: a standalone source message (video or direct-URL
+    # message) is replaced by the processed result. If it belongs to an album,
+    # only that one item was processed, so it is kept to avoid breaking the
+    # album. (Whole-album jobs always replace the album; see process_album.)
     return not getattr(reply, "grouped_id", None)
+
+
+async def get_album_messages(client: TelegramClient, chat_id: int, msg) -> list:
+    # Albums hold at most 10 items with consecutive-ish ids, so a +/-10 window
+    # around any member is enough to collect the whole group.
+    grouped_id = getattr(msg, "grouped_id", None)
+    if not grouped_id:
+        return [msg]
+    ids = list(range(max(1, msg.id - 10), msg.id + 11))
+    found = await client.get_messages(chat_id, ids=ids)
+    album = [m for m in (found or []) if m and getattr(m, "grouped_id", None) == grouped_id]
+    return sorted(album, key=lambda m: m.id) or [msg]
+
+
+def album_has_video(album: list) -> bool:
+    return any(getattr(m, "file", None) and is_video_message(m) for m in album)
+
+
+def video_attributes(meta: dict | None) -> list | None:
+    if not meta:
+        return None
+    return [
+        DocumentAttributeVideo(
+            duration=meta["duration"],
+            w=meta["width"],
+            h=meta["height"],
+            supports_streaming=True,
+        )
+    ]
+
+
+async def download_telegram_video(msg, tmp: Path, status: StatusUpdater) -> Path | None:
+    src_name = msg.file.name or f"input_{msg.id}"
+    # Album items may share a file name; keep each one in its own subdir.
+    item_dir = tmp / f"src_{msg.id}"
+    item_dir.mkdir(exist_ok=True)
+    await status.set("Downloading from Telegram...", force=True)
+    downloaded = await msg.download_media(
+        file=str(item_dir / src_name),
+        progress_callback=status.progress_callback("Downloading"),
+    )
+    if not downloaded:
+        await status.set("Download failed.", force=True)
+        return None
+    return Path(downloaded)
+
+
+async def transcode(
+    settings: Settings, job: JobRecord, src_path: Path, out_dir: Path, out_suffix: str, status: StatusUpdater
+) -> Path | None:
+    """Probe + run ffmpeg. Reports failures on the status message and returns None."""
+    out_path = out_dir / f"{src_path.stem}_{job.mode}{out_suffix}"
+    in_meta = await probe_video_metadata(settings.ffprobe_bin, src_path)
+    if not in_meta:
+        await status.set("Input is not a valid video or metadata probe failed.", force=True)
+        return None
+    await status.set("Processing with ffmpeg...", force=True)
+
+    try:
+        cmd = build_ffmpeg_cmd(settings.ffmpeg_bin, job.mode, src_path, out_path, job.extra)
+    except Exception as exc:
+        await status.set(f"Invalid command: {exc}", force=True)
+        return None
+
+    log.info("Running ffmpeg: %s", " ".join(shlex.quote(x) for x in cmd))
+    code, ffout = await run_ffmpeg_with_progress(
+        cmd,
+        status,
+        input_duration_s=in_meta.get("duration"),
+    )
+    if code != 0:
+        log.error("ffmpeg failed (%s): %s", code, ffout[-4000:])
+        await status.set(f"ffmpeg failed (exit {code}). Check logs.", force=True)
+        return None
+
+    if not out_path.exists():
+        await status.set("ffmpeg finished, but output file was not created.", force=True)
+        return None
+    return out_path
+
+
+async def delete_status_and_trigger(client: TelegramClient, job: JobRecord, status_message) -> None:
+    try:
+        # Delete both the temporary status message and the user trigger message.
+        await client.delete_messages(job.chat_id, [status_message.id, job.command_message_id])
+    except Exception:
+        log.exception("Failed to delete status/trigger message(s)")
+
+
+async def delete_source_messages(client: TelegramClient, job: JobRecord, ids: list[int]) -> None:
+    # Separate call from the status/trigger cleanup so a permission error here
+    # can't block that cleanup.
+    try:
+        affected = await client.delete_messages(job.chat_id, ids)
+        if not any(getattr(a, "pts_count", 0) for a in (affected or [])):
+            log.warning("Source message(s) %s in chat %s were not deleted (no permission?)", ids, job.chat_id)
+        else:
+            log.info("Deleted source message(s) %s in chat %s", ids, job.chat_id)
+    except Exception:
+        log.exception("Failed to delete source message(s) %s in chat %s", ids, job.chat_id)
+
+
+async def save_job_files(client: TelegramClient, settings: Settings, job: JobRecord, paths: list[Path]) -> None:
+    # CLEANUP=false: keep inputs/outputs instead of letting the temp dir vanish.
+    saved_dir = settings.work_dir / f"job_{job.reply_message_id}"
+    saved_dir.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        if path.exists():
+            path.replace(saved_dir / path.name)
+    await client.send_message(
+        job.chat_id,
+        f"Saved files to `{saved_dir}`",
+        reply_to=job.command_message_id,
+    )
 
 
 async def process_job(client: TelegramClient, settings: Settings, job: JobRecord) -> None:
@@ -736,130 +969,179 @@ async def process_job(client: TelegramClient, settings: Settings, job: JobRecord
 
     with tempfile.TemporaryDirectory(dir=settings.work_dir, prefix=JOB_TMP_PREFIX) as tmp_dir:
         tmp = Path(tmp_dir)
-        src_path: Path
-        if job.source_url:
-            src_name = filename_from_url(job.source_url, fallback=f"input_{reply.id}.mp4")
-            requested_src_path = tmp / src_name
-            await status.set("Downloading from direct URL...", force=True)
-            try:
-                src_path = await download_from_direct_url(job.source_url, requested_src_path, status)
-            except Exception as exc:
-                await status.set(f"Direct URL download failed: {exc}", force=True)
-                return
+        if job.grouped_id:
+            await process_album(client, settings, job, reply, tmp, status, status_message)
         else:
-            if not getattr(reply, "file", None) or not is_video_message(reply):
-                await status.set("Replied message is no longer a valid video.", force=True)
-                return
-            src_name = reply.file.name or f"input_{reply.id}"
-            requested_src_path = tmp / src_name
-            await status.set("Downloading from Telegram...", force=True)
-            downloaded = await reply.download_media(
-                file=str(requested_src_path),
-                progress_callback=status.progress_callback("Downloading"),
-            )
-            if not downloaded:
-                await status.set("Download failed.", force=True)
-                return
-            src_path = Path(downloaded)
+            await process_single(client, settings, job, reply, tmp, status, status_message)
 
-        out_suffix = ".mkv" if job.mode == "copy" else ".mp4"
-        out_path = tmp / f"{src_path.stem}_{job.mode}{out_suffix}"
-        in_meta = await probe_video_metadata(settings.ffprobe_bin, src_path)
-        if not in_meta:
-            await status.set("Input is not a valid video or metadata probe failed.", force=True)
-            return
-        await status.set("Processing with ffmpeg...", force=True)
 
+async def process_single(
+    client: TelegramClient, settings: Settings, job: JobRecord, reply, tmp: Path, status: StatusUpdater, status_message
+) -> None:
+    src_path: Path
+    if job.source_url:
+        src_name = filename_from_url(job.source_url, fallback=f"input_{reply.id}.mp4")
+        requested_src_path = tmp / src_name
+        await status.set("Downloading from direct URL...", force=True)
         try:
-            cmd = build_ffmpeg_cmd(settings.ffmpeg_bin, job.mode, src_path, out_path, job.extra)
+            src_path = await download_from_direct_url(job.source_url, requested_src_path, status)
         except Exception as exc:
-            await status.set(f"Invalid command: {exc}", force=True)
+            await status.set(f"Direct URL download failed: {exc}", force=True)
+            return
+    else:
+        if not getattr(reply, "file", None) or not is_video_message(reply):
+            await status.set("Replied message is no longer a valid video.", force=True)
+            return
+        downloaded = await download_telegram_video(reply, tmp, status)
+        if not downloaded:
+            return
+        src_path = downloaded
+
+    out_suffix = ".mkv" if job.mode == "copy" else ".mp4"
+    out_path = await transcode(settings, job, src_path, tmp, out_suffix, status)
+    if not out_path:
+        return
+
+    await status.set("Uploading result...", force=True)
+
+    caption, caption_entities = await build_output_caption(client, job.mode, reply)
+    attributes = None
+    if out_path.suffix.lower() == ".mp4":
+        meta = await probe_video_metadata(settings.ffprobe_bin, out_path)
+        if meta:
+            log.info("Uploading with explicit video attrs: %sx%s, %ss", meta["width"], meta["height"], meta["duration"])
+        attributes = video_attributes(meta)
+
+    delete_source = should_delete_source(job, reply)
+    # When the original is going away, don't reply to it (that would leave a
+    # dangling "deleted message" reference). Reply to whatever the original was
+    # replying to instead, which also keeps the result in the same forum topic.
+    output_reply_to = reply.reply_to_msg_id if delete_source else job.reply_message_id
+
+    await client.send_file(
+        job.chat_id,
+        str(out_path),
+        caption=caption,
+        formatting_entities=caption_entities,
+        parse_mode=None,
+        reply_to=output_reply_to,
+        supports_streaming=out_path.suffix.lower() == ".mp4",
+        force_document=False,
+        attributes=attributes,
+        progress_callback=status.progress_callback("Uploading"),
+    )
+    await status.set("Done.", force=True)
+    await delete_status_and_trigger(client, job, status_message)
+
+    if delete_source:
+        await delete_source_messages(client, job, [reply.id])
+
+    if not settings.cleanup:
+        await save_job_files(client, settings, job, [src_path, out_path])
+
+
+async def album_captions(client: TelegramClient, mode: str, album: list) -> list[tuple[str, list]]:
+    """Original per-item captions (with formatting); the footer goes on one item.
+
+    The footer ("Processed with ..." and, for forwarded albums, a link back to the
+    original) goes on the first item that already has text (Telegram shows a lone
+    caption as the album caption), or on the first item if none do.
+    """
+    captions = [(message_text(m), sendable_entities(getattr(m, "entities", None))) for m in album]
+    target = next((i for i, (text, _) in enumerate(captions) if text), 0)
+    forwarded = next((m for m in album if getattr(m, "fwd_from", None)), None)
+    footer_msg = album[target]
+    if forwarded is not None and not getattr(footer_msg, "fwd_from", None):
+        footer_msg = forwarded
+    # Build the footer from the forwarded item, but keep the target item's own text.
+    text, entities = captions[target]
+    stub = SimpleNamespace(message=text, entities=entities, fwd_from=getattr(footer_msg, "fwd_from", None),
+                           forward=getattr(footer_msg, "forward", None))
+    captions[target] = await build_output_caption(client, mode, stub)
+    return captions
+
+
+async def process_album(
+    client: TelegramClient, settings: Settings, job: JobRecord, reply, tmp: Path, status: StatusUpdater, status_message
+) -> None:
+    album = await get_album_messages(client, job.chat_id, reply)
+    if not album_has_video(album):
+        await status.set("Album no longer contains any videos.", force=True)
+        return
+
+    peer = await client.get_input_entity(job.chat_id)
+    video_count = sum(1 for m in album if getattr(m, "file", None) and is_video_message(m))
+    kept_files: list[Path] = []
+    media: list = []
+    done_videos = 0
+
+    for item in album:
+        spoiler = bool(getattr(getattr(item, "media", None), "spoiler", False))
+        if not (getattr(item, "file", None) and is_video_message(item)):
+            # Photos (and anything else) are re-sent as-is by reference: no
+            # download or re-upload, identical to the original.
+            media.append(utils.get_input_media(item.media))
+            continue
+
+        done_videos += 1
+        status.prefix = f"[video {done_videos}/{video_count}] "
+        src_path = await download_telegram_video(item, tmp, status)
+        if not src_path:
+            return
+        # Albums can't mix in a .mkv document, so `copy` stays in an mp4 container here.
+        out_path = await transcode(settings, job, src_path, src_path.parent, ".mp4", status)
+        if not out_path:
             return
 
-        log.info("Running ffmpeg: %s", " ".join(shlex.quote(x) for x in cmd))
-        code, ffout = await run_ffmpeg_with_progress(
-            cmd,
-            status,
-            input_duration_s=(in_meta or {}).get("duration"),
-        )
-        if code != 0:
-            log.error("ffmpeg failed (%s): %s", code, ffout[-4000:])
-            await status.set(f"ffmpeg failed (exit {code}). Check logs.", force=True)
-            return
-
-        if not out_path.exists():
-            await status.set("ffmpeg finished, but output file was not created.", force=True)
-            return
-
-        await status.set("Uploading result...", force=True)
-
-        caption = build_output_caption(job.mode, reply)
-        attributes = None
-        if out_path.suffix.lower() == ".mp4":
-            meta = await probe_video_metadata(settings.ffprobe_bin, out_path)
-            if meta:
-                log.info(
-                    "Uploading with explicit video attrs: %sx%s, %ss",
-                    meta["width"],
-                    meta["height"],
-                    meta["duration"],
-                )
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration=meta["duration"],
-                        w=meta["width"],
-                        h=meta["height"],
-                        supports_streaming=True,
-                    )
-                ]
-
-        delete_source = should_delete_source(job, reply)
-        # When the original is going away, don't reply to it (that would leave a
-        # dangling "deleted message" reference). Reply to whatever the original was
-        # replying to instead, which also keeps the result in the same forum topic.
-        output_reply_to = reply.reply_to_msg_id if delete_source else job.reply_message_id
-
-        await client.send_file(
-            job.chat_id,
-            str(out_path),
-            caption=caption,
-            parse_mode=None,
-            reply_to=output_reply_to,
-            supports_streaming=out_path.suffix.lower() == ".mp4",
-            force_document=False,
-            attributes=attributes,
-            progress_callback=status.progress_callback("Uploading"),
-        )
-        await status.set("Done.", force=True)
-        try:
-            # Delete both the temporary status message and the user trigger message.
-            await client.delete_messages(job.chat_id, [status_message.id, job.command_message_id])
-        except Exception:
-            log.exception("Failed to delete status/trigger message(s)")
-
-        if delete_source:
-            # Separate call so a permission error here can't block the cleanup above.
-            try:
-                affected = await client.delete_messages(job.chat_id, [reply.id])
-                if not any(getattr(a, "pts_count", 0) for a in (affected or [])):
-                    log.warning("Source message %s in chat %s was not deleted (no permission?)", reply.id, job.chat_id)
-                else:
-                    log.info("Deleted source message %s in chat %s", reply.id, job.chat_id)
-            except Exception:
-                log.exception("Failed to delete source message %s in chat %s", reply.id, job.chat_id)
-
-        if not settings.cleanup:
-            saved_dir = settings.work_dir / f"job_{job.reply_message_id}"
-            saved_dir.mkdir(parents=True, exist_ok=True)
-            src_copy = saved_dir / src_path.name
-            out_copy = saved_dir / out_path.name
-            src_path.replace(src_copy)
-            out_path.replace(out_copy)
-            await client.send_message(
-                job.chat_id,
-                f"Saved files to `{saved_dir}`",
-                reply_to=job.command_message_id,
+        meta = await probe_video_metadata(settings.ffprobe_bin, out_path)
+        await status.set("Uploading...", force=True)
+        uploaded = await client.upload_file(str(out_path), progress_callback=status.progress_callback("Uploading"))
+        attributes = (video_attributes(meta) or []) + [types.DocumentAttributeFilename(out_path.name)]
+        result = await client(
+            functions.messages.UploadMediaRequest(
+                peer=peer,
+                media=types.InputMediaUploadedDocument(
+                    file=uploaded,
+                    mime_type="video/mp4",
+                    attributes=attributes,
+                    # Marks it as a real video so a silent one isn't turned into a GIF
+                    # (Telethon's own album sender always sets this too).
+                    nosound_video=True,
+                    spoiler=spoiler or None,
+                ),
             )
+        )
+        media.append(types.InputMediaDocument(id=utils.get_input_document(result.document), spoiler=spoiler or None))
+
+        if settings.cleanup:
+            # Already uploaded; free disk space before the next video.
+            src_path.unlink(missing_ok=True)
+            out_path.unlink(missing_ok=True)
+        else:
+            kept_files += [src_path, out_path]
+
+    status.prefix = ""
+    await status.set("Sending album...", force=True)
+    multi_media = [
+        types.InputSingleMedia(media=m, message=text, entities=entities)
+        for m, (text, entities) in zip(media, await album_captions(client, job.mode, album))
+    ]
+    # The whole album was processed, so the original album is replaced: post the
+    # new one where the original was replying to (keeps threads / forum topics).
+    output_reply_to = next((m.reply_to_msg_id for m in album if getattr(m, "reply_to_msg_id", None)), None)
+    await client(
+        functions.messages.SendMultiMediaRequest(
+            peer=peer,
+            multi_media=multi_media,
+            reply_to=types.InputReplyToMessage(reply_to_msg_id=output_reply_to) if output_reply_to else None,
+        )
+    )
+    await status.set("Done.", force=True)
+    await delete_status_and_trigger(client, job, status_message)
+    await delete_source_messages(client, job, [m.id for m in album])
+
+    if kept_files:
+        await save_job_files(client, settings, job, kept_files)
 
 
 async def main() -> None:
@@ -977,7 +1259,14 @@ async def main() -> None:
                 return
 
             source_url = None
-            if not (getattr(reply, "file", None) and is_video_message(reply)):
+            grouped_id = None
+            if getattr(reply, "grouped_id", None):
+                # Replying to any item of an album (photo or video) processes the
+                # whole album, as long as it contains at least one video.
+                album = await get_album_messages(client, int(event.chat_id), reply)
+                if album_has_video(album):
+                    grouped_id = reply.grouped_id
+            if not grouped_id and not (getattr(reply, "file", None) and is_video_message(reply)):
                 source_url = extract_first_http_url(getattr(reply, "raw_text", None) or getattr(reply, "message", None))
                 if not source_url:
                     await event.reply("Replied message must be a video/file or contain a direct `http(s)` video URL.")
@@ -996,6 +1285,7 @@ async def main() -> None:
                 source_url=source_url,
                 queued_at=time.time(),
                 status_message_id=queued_msg.id,
+                grouped_id=grouped_id,
             )
             await queue_store.enqueue(job)
             queue_event.set()
